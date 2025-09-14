@@ -26,7 +26,3 @@ public class NewsDTO {
     private LocalDateTime createdAt;
     private Integer viewCount;
 }
-
-
-
-

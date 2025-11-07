@@ -1,0 +1,58 @@
+.scraper-controls {
+  background: var(--card-background);
+  padding: 2rem;
+  border-radius: 8px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  margin-bottom: 2rem;
+}
+
+.scraper-controls h2 {
+  margin-bottom: 1.5rem;
+  color: var(--text-primary);
+}
+
+.controls-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 1rem;
+  align-items: end;
+}
+
+@media (max-width: 768px) {
+  .controls-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.control-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.control-group label {
+  font-weight: 500;
+  color: var(--text-primary);
+  font-size: 0.9rem;
+}
+
+.control-group select,
+.control-group input {
+  width: 100%;
+}
+
+.scrape-button {
+  padding: 10px 24px;
+  font-size: 1rem;
+  white-space: nowrap;
+}
+
+.scraper-note {
+  margin-top: 1rem;
+  padding: 0.75rem;
+  background: #eff6ff;
+  border-left: 3px solid var(--primary-color);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}

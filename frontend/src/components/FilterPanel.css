@@ -1,0 +1,69 @@
+.filter-panel {
+  background: var(--card-background);
+  padding: 2rem;
+  border-radius: 8px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  margin-bottom: 2rem;
+}
+
+.filter-panel h2 {
+  margin-bottom: 1.5rem;
+  color: var(--text-primary);
+}
+
+.filters-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 1rem;
+}
+
+@media (max-width: 768px) {
+  .filters-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.filter-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.filter-group label {
+  font-weight: 500;
+  color: var(--text-primary);
+  font-size: 0.9rem;
+}
+
+.filter-group input,
+.filter-group select {
+  width: 100%;
+}
+
+.filter-search {
+  grid-column: span 2;
+}
+
+@media (max-width: 768px) {
+  .filter-search {
+    grid-column: span 1;
+  }
+}
+
+.filter-actions {
+  grid-column: span 2;
+  display: flex;
+  gap: 1rem;
+  margin-top: 0.5rem;
+}
+
+@media (max-width: 768px) {
+  .filter-actions {
+    grid-column: span 1;
+    flex-direction: column;
+  }
+}
+
+.filter-actions button {
+  flex: 1;
+}

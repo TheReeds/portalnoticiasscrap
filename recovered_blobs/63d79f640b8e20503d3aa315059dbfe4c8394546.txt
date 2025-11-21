@@ -1,0 +1,82 @@
+"""
+Script para iniciar el servidor backend
+"""
+import uvicorn
+from main import app
+import models
+import auth
+
+def create_default_admin():
+    """Create default admin user if it doesn't exist"""
+    db = next(models.get_db())
+    try:
+        # Check if any admin user exists
+        existing_admin = db.query(models.User).filter(models.User.is_admin == True).first()
+
+        if not existing_admin:
+            print("\n" + "=" * 50)
+            print("📝 Creando usuario administrador por defecto...")
+            print("=" * 50)
+
+            # Create default admin
+            admin_data = {
+                "email": "admin@portal.com",
+                "username": "admin",
+                "password": "admin123",
+                "full_name": "Administrador"
+            }
+
+            hashed_password = auth.get_password_hash(admin_data["password"])
+            admin_user = models.User(
+                email=admin_data["email"],
+                username=admin_data["username"],
+                hashed_password=hashed_password,
+                full_name=admin_data["full_name"],
+                is_admin=True,
+                is_active=True,
+                subscription_plan="premium"
+            )
+
+            db.add(admin_user)
+            db.commit()
+            db.refresh(admin_user)
+
+            print(f"\n✅ Usuario administrador creado exitosamente!")
+            print(f"   📧 Email: {admin_data['email']}")
+            print(f"   👤 Usuario: {admin_data['username']}")
+            print(f"   🔑 Contraseña: {admin_data['password']}")
+            print(f"\n⚠️  IMPORTANTE: Cambia la contraseña después del primer login!")
+            print("=" * 50 + "\n")
+        else:
+            print(f"\n✓ Usuario admin ya existe: {existing_admin.username}\n")
+
+    except Exception as e:
+        print(f"\n⚠️  Error al crear usuario admin: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+if __name__ == "__main__":
+    print("=" * 50)
+    print("🚀 Iniciando News Scraper Backend")
+    print("=" * 50)
+
+    # Initialize database
+    print("\n📦 Inicializando base de datos...")
+    models.init_db()
+    print("✅ Base de datos inicializada")
+
+    # Create default admin user if needed
+    create_default_admin()
+
+    print("📍 API disponible en: http://localhost:8000")
+    print("📚 Documentación: http://localhost:8000/docs")
+    print("\n✨ Presiona Ctrl+C para detener el servidor\n")
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )

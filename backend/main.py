@@ -1,0 +1,881 @@
+from fastapi import FastAPI, Depends, HTTPException, Query, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional
+from pydantic import BaseModel, EmailStr
+import models
+import scrapers
+import historical_scraper
+import auth
+import analytics
+import ml_model
+import uuid
+
+app = FastAPI(title="News Scraper API", version="1.0.0")
+
+# CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify your frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize database
+models.init_db()
+
+# Store historical scraping tasks status (in production, use Redis or database)
+historical_tasks = {}
+
+# Pydantic models for request/response
+class UserRegister(BaseModel):
+    email: EmailStr
+    username: str
+    password: str
+    full_name: Optional[str] = None
+
+class UserResponse(BaseModel):
+    id: int
+    email: str
+    username: str
+    full_name: Optional[str]
+    is_active: bool
+    is_admin: bool
+    subscription_plan: Optional[str] = "free"
+    created_at: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user: UserResponse
+
+@app.get("/")
+def root():
+    return {
+        "message": "News Scraper API",
+        "endpoints": {
+            "scrape": "/scrape",
+            "articles": "/articles",
+            "sources": "/sources",
+            "search": "/articles/search"
+        }
+    }
+
+@app.post("/scrape")
+def scrape_news(
+    source: Optional[str] = None,
+    limit: int = Query(default=10, ge=1, le=50),
+    db: Session = Depends(models.get_db)
+):
+    """
+    Scrape news articles from specified source or all sources
+
+    - **source**: Name of the news source (optional, scrapes all if not specified)
+    - **limit**: Number of articles to scrape per source (1-50)
+    """
+    all_scrapers = scrapers.get_all_scrapers()
+
+    if source:
+        # Filter scraper by source name
+        selected_scrapers = [s for s in all_scrapers if s.name.lower() == source.lower()]
+        if not selected_scrapers:
+            raise HTTPException(status_code=404, detail=f"Source '{source}' not found")
+    else:
+        selected_scrapers = all_scrapers
+
+    scraped_count = 0
+    new_articles = []
+
+    for scraper in selected_scrapers:
+        print(f"Scraping {scraper.name}...")
+        articles = scraper.fetch_articles(limit=limit)
+
+        for article_data in articles:
+            # Check if article already exists
+            existing = db.query(models.Article).filter(
+                models.Article.url == article_data['url']
+            ).first()
+
+            if not existing:
+                article = models.Article(**article_data)
+                db.add(article)
+                scraped_count += 1
+                new_articles.append(article_data)
+
+        db.commit()
+
+    return {
+        "status": "success",
+        "scraped": scraped_count,
+        "sources": [s.name for s in selected_scrapers],
+        "articles": new_articles
+    }
+
+@app.get("/articles")
+def get_articles(
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, ge=1, le=100),
+    source: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    db: Session = Depends(models.get_db)
+):
+    """
+    Get articles with optional filtering
+
+    - **skip**: Number of articles to skip (pagination)
+    - **limit**: Maximum number of articles to return (1-100)
+    - **source**: Filter by news source
+    - **start_date**: Filter articles from this date (YYYY-MM-DD)
+    - **end_date**: Filter articles until this date (YYYY-MM-DD)
+    """
+    query = db.query(models.Article)
+
+    # Filter by source
+    if source:
+        query = query.filter(models.Article.source.ilike(f"%{source}%"))
+
+    # Filter by date range
+    if start_date:
+        try:
+            start = datetime.fromisoformat(start_date)
+            query = query.filter(models.Article.published_date >= start)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid start_date format. Use YYYY-MM-DD")
+
+    if end_date:
+        try:
+            end = datetime.fromisoformat(end_date)
+            # Add one day to include the entire end_date
+            end = end + timedelta(days=1)
+            query = query.filter(models.Article.published_date < end)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid end_date format. Use YYYY-MM-DD")
+
+    # Get total count
+    total = query.count()
+
+    # Get paginated results
+    articles = query.order_by(models.Article.published_date.desc()).offset(skip).limit(limit).all()
+
+    return {
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "articles": [article.to_dict() for article in articles]
+    }
+
+@app.get("/articles/{article_id}")
+def get_article(article_id: int, db: Session = Depends(models.get_db)):
+    """Get a specific article by ID and increment view count"""
+    article = db.query(models.Article).filter(models.Article.id == article_id).first()
+
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+
+    # Increment view count
+    article.views += 1
+    db.commit()
+
+    return article.to_dict()
+
+@app.get("/articles/search")
+def search_articles(
+    q: str = Query(..., min_length=1),
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, ge=1, le=100),
+    db: Session = Depends(models.get_db)
+):
+    """
+    Search articles by title or content
+
+    - **q**: Search query
+    - **skip**: Number of articles to skip (pagination)
+    - **limit**: Maximum number of articles to return
+    """
+    query = db.query(models.Article).filter(
+        (models.Article.title.ilike(f"%{q}%")) |
+        (models.Article.content.ilike(f"%{q}%"))
+    )
+
+    total = query.count()
+    articles = query.order_by(models.Article.published_date.desc()).offset(skip).limit(limit).all()
+
+    return {
+        "total": total,
+        "query": q,
+        "articles": [article.to_dict() for article in articles]
+    }
+
+@app.get("/sources")
+def get_sources(db: Session = Depends(models.get_db)):
+    """Get list of available news sources and article counts"""
+    all_scrapers = scrapers.get_all_scrapers()
+
+    sources_info = []
+    for scraper in all_scrapers:
+        count = db.query(models.Article).filter(models.Article.source == scraper.name).count()
+        sources_info.append({
+            "name": scraper.name,
+            "article_count": count
+        })
+
+    return {"sources": sources_info}
+
+@app.get("/categories")
+def get_categories(db: Session = Depends(models.get_db)):
+    """Get list of categories with article counts"""
+    from sqlalchemy import func
+
+    categories = db.query(
+        models.Article.category,
+        func.count(models.Article.id).label('count')
+    ).group_by(models.Article.category).all()
+
+    return {
+        "categories": [
+            {"name": cat, "count": count}
+            for cat, count in categories
+        ]
+    }
+
+@app.get("/articles/popular/top")
+def get_popular_articles(
+    limit: int = Query(default=10, ge=1, le=50),
+    db: Session = Depends(models.get_db)
+):
+    """Get most viewed articles"""
+    articles = db.query(models.Article)\
+        .order_by(models.Article.views.desc())\
+        .limit(limit)\
+        .all()
+
+    return {
+        "articles": [article.to_dict() for article in articles]
+    }
+
+@app.get("/articles/category/{category}")
+def get_articles_by_category(
+    category: str,
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, ge=1, le=100),
+    db: Session = Depends(models.get_db)
+):
+    """Get articles by category"""
+    query = db.query(models.Article).filter(models.Article.category == category)
+    total = query.count()
+    articles = query.order_by(models.Article.published_date.desc()).offset(skip).limit(limit).all()
+
+    return {
+        "total": total,
+        "category": category,
+        "articles": [article.to_dict() for article in articles]
+    }
+
+@app.delete("/articles/{article_id}")
+def delete_article(article_id: int, db: Session = Depends(models.get_db)):
+    """Delete a specific article"""
+    article = db.query(models.Article).filter(models.Article.id == article_id).first()
+
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+
+    db.delete(article)
+    db.commit()
+
+    return {"status": "success", "message": f"Article {article_id} deleted"}
+
+@app.get("/export/articles")
+def export_articles(
+    format: str = Query(default="json", regex="^(json|csv)$"),
+    content_type: Optional[str] = Query(default=None, regex="^(articles|videos|all)$"),
+    source: Optional[str] = None,
+    db: Session = Depends(models.get_db)
+):
+    """
+    Export articles in JSON or CSV format
+
+    - **format**: Export format (json or csv)
+    - **content_type**: Filter by type (articles, videos, or all)
+    - **source**: Filter by specific source (optional)
+    """
+    import csv
+    import io
+    from fastapi.responses import StreamingResponse
+
+    # Build query
+    query = db.query(models.Article)
+
+    if source:
+        query = query.filter(models.Article.source == source)
+
+    if content_type == "videos":
+        query = query.filter(models.Article.source.contains("YouTube"))
+    elif content_type == "articles":
+        query = query.filter(~models.Article.source.contains("YouTube"))
+
+    articles = query.order_by(models.Article.published_date.desc()).all()
+
+    if format == "json":
+        # Export as JSON
+        data = [article.to_dict() for article in articles]
+        return {
+            "total": len(data),
+            "content_type": content_type or "all",
+            "source": source or "all",
+            "articles": data
+        }
+    else:
+        # Export as CSV
+        output = io.StringIO()
+        fieldnames = ['id', 'title', 'source', 'author', 'url', 'published_date', 'views', 'category', 'summary']
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+
+        writer.writeheader()
+        for article in articles:
+            writer.writerow({
+                'id': article.id,
+                'title': article.title,
+                'source': article.source,
+                'author': article.author or '',
+                'url': article.url,
+                'published_date': article.published_date.isoformat() if article.published_date else '',
+                'views': article.views,
+                'category': article.category,
+                'summary': (article.summary or '')[:200]  # Limit summary length for CSV
+            })
+
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=news_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"}
+        )
+
+@app.post("/scrape/historical")
+def start_historical_scraping(
+    background_tasks: BackgroundTasks,
+    source: Optional[str] = None,
+    days: int = Query(default=15, ge=7, le=30),
+    db: Session = Depends(models.get_db)
+):
+    """
+    Start historical scraping (15-30 days back) for specified source or all sources
+
+    - **source**: Name of the news source (optional, scrapes all supported sources if not specified)
+    - **days**: Number of days to scrape back (7-30 days)
+
+    Returns task_id to track progress
+    """
+    available_sources = historical_scraper.get_available_historical_sources()
+
+    if source:
+        if source not in available_sources:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Source '{source}' does not support historical scraping. Available: {', '.join(available_sources)}"
+            )
+        sources_to_scrape = [source]
+    else:
+        sources_to_scrape = available_sources
+
+    # Create task ID
+    task_id = str(uuid.uuid4())
+
+    # Create status tracker
+    status = historical_scraper.HistoricalScrapingStatus(
+        task_id=task_id,
+        source=", ".join(sources_to_scrape),
+        target_days=days
+    )
+    historical_tasks[task_id] = status
+
+    # Start background task (don't pass db session, create new one inside task)
+    background_tasks.add_task(
+        run_historical_scraping,
+        task_id=task_id,
+        sources_to_scrape=sources_to_scrape,
+        days=days
+    )
+
+    return {
+        "status": "started",
+        "task_id": task_id,
+        "sources": sources_to_scrape,
+        "target_days": days,
+        "message": f"Historical scraping started for {len(sources_to_scrape)} source(s). Use /scrape/historical/status/{task_id} to track progress."
+    }
+
+
+def run_historical_scraping(task_id: str, sources_to_scrape: List[str], days: int):
+    """Background task to run historical scraping"""
+    status = historical_tasks.get(task_id)
+    if not status:
+        return
+
+    # Create a new database session for this background task
+    db = next(models.get_db())
+    batch_size = 50  # Commit every 50 articles
+
+    try:
+        for source_name in sources_to_scrape:
+            print(f"Starting historical scraping for {source_name}...")
+
+            scraper = historical_scraper.get_historical_scraper(source_name)
+            if not scraper:
+                continue
+
+            # Fetch historical articles
+            articles = scraper.fetch_historical_articles(days, status)
+
+            print(f"📦 Processing {len(articles)} articles from {source_name}...")
+
+            # Get all existing URLs for this source to avoid N queries
+            existing_urls = set(
+                url for (url,) in db.query(models.Article.url).filter(
+                    models.Article.source == source_name
+                ).all()
+            )
+            print(f"   📋 Found {len(existing_urls)} existing articles in database for {source_name}")
+
+            # Debug: Show first 5 URLs from both sets with detailed duplicate analysis
+            if articles:
+                print("   🔍 First 5 scraped URLs:")
+                for i, art in enumerate(articles[:5], 1):
+                    scraped_url = art.get('url', 'NO URL')
+                    is_dup = scraped_url in existing_urls
+                    print(f"      {i}. Scraped URL: {scraped_url}")
+                    print(f"         Length: {len(scraped_url)} chars")
+                    print(f"         Is duplicate in DB? {is_dup}")
+                    if is_dup:
+                        # Find exact match in existing_urls
+                        for existing in existing_urls:
+                            if existing == scraped_url:
+                                print(f"         Matches: {existing}")
+                                print(f"         URLs identical: {scraped_url == existing}")
+                                break
+            if existing_urls:
+                print("   🔍 First 5 existing URLs in DB:")
+                for i, url in enumerate(list(existing_urls)[:5], 1):
+                    print(f"      {i}. DB URL: {url}")
+                    print(f"         Length: {len(url)} chars")
+
+            # Save articles to database in batches
+            batch_count = 0
+            duplicates_skipped = 0
+            urls_in_current_batch = set()
+
+            for i, article_data in enumerate(articles):
+                try:
+                    article_url = article_data['url']
+
+                    # Check if URL exists in DB or in current batch
+                    if article_url in existing_urls or article_url in urls_in_current_batch:
+                        duplicates_skipped += 1
+                        continue
+
+                    # Add new article to session and track URL
+                    article = models.Article(**article_data)
+                    db.add(article)
+                    urls_in_current_batch.add(article_url)
+                    batch_count += 1
+
+                    # Commit in batches
+                    if batch_count >= batch_size or i == len(articles) - 1:
+                        if batch_count > 0:  # Only commit if there are new articles
+                            try:
+                                db.commit()
+                                # Add committed URLs to existing set
+                                existing_urls.update(urls_in_current_batch)
+                                status.articles_saved += batch_count
+                                print(f"   ✅ Committed {batch_count} articles - Total saved: {status.articles_saved} (skipped {duplicates_skipped} duplicates)")
+                                batch_count = 0
+                                urls_in_current_batch = set()
+                            except Exception as commit_error:
+                                print(f"   ⚠️ Error committing batch: {commit_error}")
+                                print(f"   Error details: {str(commit_error)}")
+                                db.rollback()
+                                batch_count = 0
+                                urls_in_current_batch = set()
+
+                except Exception as article_error:
+                    print(f"   ⚠️ Error processing article: {article_error}")
+                    continue
+
+            if duplicates_skipped > 0 and status.articles_saved == 0:
+                print(f"ℹ️  All {duplicates_skipped} articles from {source_name} were duplicates (already in database)")
+                print("   This usually means you've already scraped this time period before.")
+                print("   To get new articles, try scraping a different date range or wait for new content.")
+            else:
+                print(f"✅ Completed {source_name}: {status.articles_saved} new articles saved (skipped {duplicates_skipped} duplicates)")
+
+        status.status = "completed"
+        print(f"🎉 Historical scraping completed: Task {task_id} - Total saved: {status.articles_saved}")
+
+    except Exception as e:
+        print(f"❌ Error in historical scraping task {task_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        status.status = "error"
+        status.error_message = str(e)
+        db.rollback()
+    finally:
+        db.close()
+
+
+@app.get("/scrape/historical/status/{task_id}")
+def get_historical_scraping_status(task_id: str):
+    """
+    Get status of historical scraping task
+
+    - **task_id**: Task ID returned by /scrape/historical
+    """
+    status = historical_tasks.get(task_id)
+
+    if not status:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    return status.to_dict()
+
+
+@app.get("/scrape/historical/available-sources")
+def get_historical_sources():
+    """Get list of sources that support historical scraping"""
+    sources = historical_scraper.get_available_historical_sources()
+    return {
+        "sources": sources,
+        "count": len(sources)
+    }
+
+
+# ==================== AUTH ENDPOINTS ====================
+
+@app.post("/api/auth/register", response_model=UserResponse)
+def register(user_data: UserRegister, db: Session = Depends(models.get_db)):
+    """Register a new user"""
+    # Check if email already exists
+    existing_user = auth.get_user_by_email(db, user_data.email)
+    if existing_user:
+        raise HTTPException(
+            status_code=400,
+            detail="Email already registered"
+        )
+
+    # Check if username already exists
+    existing_user = auth.get_user_by_username(db, user_data.username)
+    if existing_user:
+        raise HTTPException(
+            status_code=400,
+            detail="Username already taken"
+        )
+
+    # Create new user
+    hashed_password = auth.get_password_hash(user_data.password)
+    new_user = models.User(
+        email=user_data.email,
+        username=user_data.username,
+        hashed_password=hashed_password,
+        full_name=user_data.full_name,
+        is_active=True,
+        is_admin=False
+    )
+
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+
+    return UserResponse(**new_user.to_dict())
+
+
+@app.post("/api/auth/login", response_model=Token)
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(models.get_db)
+):
+    """Login and get access token"""
+    user = auth.authenticate_user(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    access_token_expires = timedelta(minutes=auth.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = auth.create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+
+    return Token(
+        access_token=access_token,
+        token_type="bearer",
+        user=UserResponse(**user.to_dict())
+    )
+
+
+@app.get("/api/auth/me", response_model=UserResponse)
+async def get_current_user_info(
+    current_user: models.User = Depends(auth.get_current_active_user)
+):
+    """Get current user information"""
+    return UserResponse(**current_user.to_dict())
+
+
+@app.get("/api/auth/check")
+async def check_auth(
+    current_user: models.User = Depends(auth.get_current_active_user)
+):
+    """Check if user is authenticated"""
+    return {
+        "authenticated": True,
+        "user": UserResponse(**current_user.to_dict())
+    }
+
+
+@app.post("/api/auth/change-plan")
+async def change_subscription_plan(
+    plan: str,
+    current_user: models.User = Depends(auth.get_current_active_user),
+    db: Session = Depends(models.get_db)
+):
+    """Change user subscription plan"""
+    valid_plans = ["free", "basic", "premium"]
+
+    if plan not in valid_plans:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid plan. Must be one of: {', '.join(valid_plans)}"
+        )
+
+    # Update user's plan
+    current_user.subscription_plan = plan
+    db.commit()
+    db.refresh(current_user)
+
+    return {
+        "message": f"Plan changed to {plan} successfully",
+        "user": UserResponse(**current_user.to_dict())
+    }
+
+
+# ==================== RSS FEED ENDPOINTS ====================
+
+class RSSFeedCreate(BaseModel):
+    url: str
+    name: str
+
+@app.get("/api/rss")
+def get_user_rss_feeds(
+    current_user: models.User = Depends(auth.get_current_active_user),
+    db: Session = Depends(models.get_db)
+):
+    """Get all RSS feeds added by the user"""
+    feeds = db.query(models.RSSFeed).filter(models.RSSFeed.user_id == current_user.id).all()
+    return {"feeds": [feed.to_dict() for feed in feeds]}
+
+@app.post("/api/rss")
+def add_rss_feed(
+    feed_data: RSSFeedCreate,
+    current_user: models.User = Depends(auth.get_current_active_user),
+    db: Session = Depends(models.get_db)
+):
+    """Add a new RSS feed"""
+    # Check if user is premium or admin
+    if current_user.subscription_plan != "premium" and not current_user.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Premium users can add custom RSS feeds"
+        )
+
+    # Check if feed already exists
+    existing = db.query(models.RSSFeed).filter(models.RSSFeed.url == feed_data.url).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="RSS feed already exists")
+
+    new_feed = models.RSSFeed(
+        url=feed_data.url,
+        name=feed_data.name,
+        user_id=current_user.id
+    )
+
+    try:
+        db.add(new_feed)
+        db.commit()
+        db.refresh(new_feed)
+        return new_feed.to_dict()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/api/rss/{feed_id}")
+def delete_rss_feed(
+    feed_id: int,
+    current_user: models.User = Depends(auth.get_current_active_user),
+    db: Session = Depends(models.get_db)
+):
+    """Delete an RSS feed"""
+    feed = db.query(models.RSSFeed).filter(models.RSSFeed.id == feed_id).first()
+    
+    if not feed:
+        raise HTTPException(status_code=404, detail="Feed not found")
+        
+    # Only owner or admin can delete
+    if feed.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Not authorized to delete this feed")
+
+    db.delete(feed)
+    db.commit()
+    return {"status": "success", "message": "Feed deleted"}
+
+
+# ==================== ADMIN DASHBOARD ENDPOINTS ====================
+
+@app.get("/api/admin/stats")
+async def get_admin_stats(
+    current_user: models.User = Depends(auth.get_current_admin_user),
+    db: Session = Depends(models.get_db)
+):
+    """Get dashboard statistics for admin"""
+    from sqlalchemy import func, desc
+    from datetime import datetime, timedelta
+
+    # Total articles
+    total_articles = db.query(func.count(models.Article.id)).scalar()
+
+    # Articles by source
+    articles_by_source = db.query(
+        models.Article.source,
+        func.count(models.Article.id).label('count')
+    ).group_by(models.Article.source).all()
+
+    # Recent articles (last 7 days)
+    seven_days_ago = datetime.utcnow() - timedelta(days=7)
+    recent_articles = db.query(func.count(models.Article.id)).filter(
+        models.Article.scraped_at >= seven_days_ago
+    ).scalar()
+
+    # Articles by day (last 30 days)
+    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    articles_by_day = db.query(
+        func.date(models.Article.scraped_at).label('date'),
+        func.count(models.Article.id).label('count')
+    ).filter(
+        models.Article.scraped_at >= thirty_days_ago
+    ).group_by(func.date(models.Article.scraped_at)).order_by(desc('date')).all()
+
+    # Total users
+    total_users = db.query(func.count(models.User.id)).scalar()
+
+    # Users by subscription plan
+    users_by_plan = db.query(
+        models.User.subscription_plan,
+        func.count(models.User.id).label('count')
+    ).group_by(models.User.subscription_plan).all()
+
+    # Most viewed articles
+    top_articles = db.query(models.Article).order_by(
+        desc(models.Article.views)
+    ).limit(10).all()
+
+    # Articles by category
+    articles_by_category = db.query(
+        models.Article.category,
+        func.count(models.Article.id).label('count')
+    ).group_by(models.Article.category).all()
+
+    return {
+        "total_articles": total_articles,
+        "recent_articles_7days": recent_articles,
+        "articles_by_source": [
+            {"source": source, "count": count}
+            for source, count in articles_by_source
+        ],
+        "articles_by_day": [
+            {"date": str(date), "count": count}
+            for date, count in articles_by_day
+        ],
+        "total_users": total_users,
+        "users_by_plan": [
+            {"plan": plan, "count": count}
+            for plan, count in users_by_plan
+        ],
+        "top_articles": [article.to_dict() for article in top_articles],
+        "articles_by_category": [
+            {"category": cat, "count": count}
+            for cat, count in articles_by_category
+        ]
+    }
+
+# ==================== ANALYTICS & ML ENDPOINTS ====================
+
+@app.get("/api/analytics/clustering")
+def get_analytics_clustering(
+    days: int = Query(7, description="Number of days to analyze"),
+    n_clusters: int = Query(5, description="Number of clusters to form"),
+    db: Session = Depends(models.get_db),
+    current_user: models.User = Depends(auth.get_current_active_user)
+):
+    if not current_user.is_admin and current_user.subscription_plan != "premium":
+        raise HTTPException(status_code=403, detail="Access restricted to Premium users")
+    
+    # Fetch articles
+    cutoff_date = datetime.now() - timedelta(days=days)
+    articles = db.query(models.Article).filter(models.Article.published_date >= cutoff_date).all()
+    
+    if not articles:
+        return {"clustering": {"total_articles": 0, "clusters": []}, "trends": []}
+        
+    articles_data = [a.to_dict() for a in articles]
+    
+    # Perform analytics
+    analyzer = analytics.ArticleAnalytics(articles_data)
+    clustering_results = analyzer.perform_clustering(n_clusters=n_clusters)
+    trends_results = analyzer.get_cluster_trends()
+    
+    return {
+        "clustering": clustering_results,
+        "trends": trends_results
+    }
+
+@app.get("/api/ml/status")
+def get_model_status(
+    current_user: models.User = Depends(auth.get_current_active_user)
+):
+    if not current_user.is_admin and current_user.subscription_plan != "premium":
+        raise HTTPException(status_code=403, detail="Access restricted to Premium users")
+        
+    predictor = ml_model.NewsPredictor()
+    return predictor.get_model_status()
+
+@app.post("/api/ml/train")
+def train_model(
+    background_tasks: BackgroundTasks,
+    current_user: models.User = Depends(auth.get_current_admin_user),
+    db: Session = Depends(models.get_db)
+):
+    # Fetch all articles for training
+    articles = db.query(models.Article).all()
+    articles_data = [a.to_dict() for a in articles]
+    
+    predictor = ml_model.NewsPredictor()
+    
+    # Run training in background
+    background_tasks.add_task(predictor.train_category_model, articles_data)
+    
+    return {"status": "Training started", "article_count": len(articles_data)}
+
+@app.post("/api/ml/predict")
+def predict_category(
+    text: str,
+    current_user: models.User = Depends(auth.get_current_active_user)
+):
+    if not current_user.is_admin and current_user.subscription_plan != "premium":
+        raise HTTPException(status_code=403, detail="Access restricted to Premium users")
+        
+    predictor = ml_model.NewsPredictor()
+    result = predictor.predict_category(text)
+    
+    return result
